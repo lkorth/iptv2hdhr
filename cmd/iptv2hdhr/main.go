@@ -56,7 +56,7 @@ func main() {
 	addr := fmt.Sprintf(":%d", cfg.Device.HTTPPort)
 	httpServer := &http.Server{
 		Addr:    addr,
-		Handler: server.New(cfg, lin, gf),
+		Handler: server.New(ctx, cfg, lin, gf),
 	}
 
 	sigCh := make(chan os.Signal, 1)

@@ -1,11 +1,15 @@
 package streamproxy
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"os/exec"
 	"path/filepath"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"iptv2hdhr/internal/config"
 	"iptv2hdhr/internal/lineup"
@@ -26,7 +30,7 @@ func newTestLineup(t *testing.T) *lineup.Lineup {
 
 func TestServeHTTP_UnknownChannel404(t *testing.T) {
 	l := newTestLineup(t)
-	h := New(l)
+	h := New(l, context.Background())
 
 	w := httptest.NewRecorder()
 	r := httptest.NewRequest("GET", "/stream/9999", nil)
@@ -40,7 +44,7 @@ func TestServeHTTP_UnknownChannel404(t *testing.T) {
 func TestServeHTTP_ConfiguredButUnmatched503(t *testing.T) {
 	l := newTestLineup(t)
 	l.Rebuild(nil) // no entries: 1001 stays unmatched
-	h := New(l)
+	h := New(l, context.Background())
 
 	w := httptest.NewRecorder()
 	r := httptest.NewRequest("GET", "/stream/1001", nil)
@@ -54,7 +58,7 @@ func TestServeHTTP_ConfiguredButUnmatched503(t *testing.T) {
 func TestServeHTTP_ReservedSlotWithNoMatchRule503(t *testing.T) {
 	l := newTestLineup(t)
 	l.Rebuild(nil)
-	h := New(l)
+	h := New(l, context.Background())
 
 	w := httptest.NewRecorder()
 	r := httptest.NewRequest("GET", "/stream/1004", nil)
@@ -76,7 +80,7 @@ func TestServeHTTP_StreamsUpstreamBody(t *testing.T) {
 	l.Rebuild([]playlist.Entry{
 		{Name: "ESPN HD", TvgID: "ESPN.us", URL: upstream.URL},
 	})
-	h := New(l)
+	h := New(l, context.Background())
 
 	w := httptest.NewRecorder()
 	r := httptest.NewRequest("GET", "/stream/1001", nil)
@@ -103,7 +107,7 @@ func TestServeHTTP_UpstreamErrorMapsTo503(t *testing.T) {
 	l.Rebuild([]playlist.Entry{
 		{Name: "ESPN HD", TvgID: "ESPN.us", URL: upstream.URL},
 	})
-	h := New(l)
+	h := New(l, context.Background())
 
 	w := httptest.NewRecorder()
 	r := httptest.NewRequest("GET", "/stream/1001", nil)
@@ -153,7 +157,7 @@ func TestServeHTTP_NonHLSUpstreamIsPassedThroughWithoutFfmpeg(t *testing.T) {
 	l.Rebuild([]playlist.Entry{
 		{Name: "ESPN HD", TvgID: "ESPN.us", URL: upstream.URL},
 	})
-	h := New(l)
+	h := New(l, context.Background())
 
 	w := httptest.NewRecorder()
 	r := httptest.NewRequest("GET", "/stream/1001", nil)
@@ -182,7 +186,7 @@ func TestServeHTTP_HLSUpstreamWithoutFfmpegReturns503(t *testing.T) {
 	l.Rebuild([]playlist.Entry{
 		{Name: "ESPN HD", TvgID: "ESPN.us", URL: upstream.URL},
 	})
-	h := New(l)
+	h := New(l, context.Background())
 
 	w := httptest.NewRecorder()
 	r := httptest.NewRequest("GET", "/stream/1001", nil)
@@ -218,7 +222,7 @@ func TestServeHTTP_HLSUpstreamIsRemuxedToMPEGTS(t *testing.T) {
 	l.Rebuild([]playlist.Entry{
 		{Name: "ESPN HD", TvgID: "ESPN.us", URL: upstream.URL + "/playlist.m3u8"},
 	})
-	h := New(l)
+	h := New(l, context.Background())
 
 	w := httptest.NewRecorder()
 	r := httptest.NewRequest("GET", "/stream/1001", nil)
@@ -236,5 +240,59 @@ func TestServeHTTP_HLSUpstreamIsRemuxedToMPEGTS(t *testing.T) {
 	}
 	if body[0] != 0x47 {
 		t.Errorf("remuxed body does not start with MPEG-TS sync byte: got %#x", body[0])
+	}
+}
+
+func TestServeHTTP_ConcurrentRequestsShareOneUpstreamConnection(t *testing.T) {
+	var connections atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		connections.Add(1)
+		w.Header().Set("Content-Type", "video/mp2t")
+		flusher := w.(http.Flusher)
+		for i := 0; i < 50; i++ {
+			w.Write([]byte("x"))
+			flusher.Flush()
+			time.Sleep(2 * time.Millisecond)
+		}
+	}))
+	defer upstream.Close()
+
+	l := newTestLineup(t)
+	l.Rebuild([]playlist.Entry{
+		{Name: "ESPN HD", TvgID: "ESPN.us", URL: upstream.URL},
+	})
+	h := New(l, context.Background())
+
+	run := func() (int, int) {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+		defer cancel()
+		r := httptest.NewRequest("GET", "/stream/1001", nil).WithContext(ctx)
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, r)
+		return w.Code, w.Body.Len()
+	}
+
+	var wg sync.WaitGroup
+	codes := make([]int, 2)
+	lens := make([]int, 2)
+	for i := 0; i < 2; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			codes[i], lens[i] = run()
+		}(i)
+	}
+	wg.Wait()
+
+	for i := range codes {
+		if codes[i] != http.StatusOK {
+			t.Errorf("request %d: status = %d, want %d", i, codes[i], http.StatusOK)
+		}
+		if lens[i] == 0 {
+			t.Errorf("request %d: received no data", i)
+		}
+	}
+	if got := connections.Load(); got != 1 {
+		t.Errorf("upstream connections opened = %d, want 1 (subscribers should share one session)", got)
 	}
 }

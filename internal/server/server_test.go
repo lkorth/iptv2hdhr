@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"encoding/xml"
 	"net/http"
@@ -42,7 +43,7 @@ func newTestServer(t *testing.T) *Server {
 
 	gf := guide.NewFetcher(nil)
 
-	return New(cfg, lin, gf)
+	return New(context.Background(), cfg, lin, gf)
 }
 
 func TestServer_Discover(t *testing.T) {

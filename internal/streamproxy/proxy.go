@@ -3,27 +3,35 @@
 // transparently remuxing HLS upstreams to MPEG-TS (via ffmpeg) since
 // HDHomeRun clients expect a continuous MPEG-TS byte stream rather than an
 // HLS manifest.
+//
+// All clients currently tuned to the same channel number share a single
+// upstream connection (and, for HLS, a single ffmpeg process): the first
+// request for a channel starts a session, and subsequent requests for the
+// same channel subscribe to that session's output. This keeps the number of
+// upstream connections opened against an IPTV provider in line with the
+// number of distinct channels being watched, rather than the number of Plex
+// tuner sessions.
 package streamproxy
 
 import (
-	"bytes"
-	"log"
+	"context"
 	"net"
 	"net/http"
 	"net/url"
-	"os/exec"
 	"path"
 	"strings"
+	"sync"
 	"time"
 
 	"iptv2hdhr/internal/lineup"
 )
 
-// copyBufferSize is the chunk size used when copying stream data to the
-// client. Each chunk is flushed immediately for low-latency live streaming.
+// copyBufferSize is the chunk size used when reading from the upstream (or
+// ffmpeg) and broadcasting to subscribers. Each chunk is flushed immediately
+// to subscribers for low-latency live streaming.
 const copyBufferSize = 64 * 1024
 
-// upstreamUserAgent is sent both on our own probe request and (via
+// upstreamUserAgent is sent both on our own upstream request and (via
 // ffmpeg's -user_agent) on the remux input request.
 const upstreamUserAgent = "iptv2hdhr/1.0"
 
@@ -32,14 +40,24 @@ const upstreamUserAgent = "iptv2hdhr/1.0"
 var ffmpegPath = "ffmpeg"
 
 // Handler serves /stream/{number} by proxying (or remuxing) the current
-// best-match upstream URL for that channel.
+// best-match upstream URL for that channel, sharing one session (and one
+// upstream connection) across all subscribers to the same channel.
 type Handler struct {
 	lineup *lineup.Lineup
 	client *http.Client
+
+	// ctx bounds the lifetime of all sessions: when it's cancelled (e.g. on
+	// server shutdown), every active upstream connection/ffmpeg process is
+	// torn down.
+	ctx context.Context
+
+	mu       sync.Mutex
+	sessions map[string]*session // channel number -> active session
 }
 
-// New creates a stream proxy handler backed by the given lineup.
-func New(l *lineup.Lineup) *Handler {
+// New creates a stream proxy handler backed by the given lineup. ctx bounds
+// the lifetime of shared upstream connections and ffmpeg processes.
+func New(l *lineup.Lineup, ctx context.Context) *Handler {
 	return &Handler{
 		lineup: l,
 		client: &http.Client{
@@ -50,19 +68,24 @@ func New(l *lineup.Lineup) *Handler {
 			},
 			// No overall Timeout: streams are long-lived.
 		},
+		ctx:      ctx,
+		sessions: make(map[string]*session),
 	}
 }
 
 // ServeHTTP handles GET /stream/{number}.
 //
-// - If {number} is not a configured channel, responds 404 (genuinely
-//   doesn't exist; a stale Plex scan or config error).
-// - If {number} is configured but currently has no matched upstream URL, or
-//   the upstream is unreachable/erroring, responds 503 (temporarily
-//   unavailable; normal/transient, does not imply a rescan is needed).
-// - If the upstream is an HLS playlist (by Content-Type or .m3u8/.m3u
-//   extension), the response is remuxed to MPEG-TS via ffmpeg. Otherwise the
-//   upstream body is passed through as-is.
+//   - If {number} is not a configured channel, responds 404 (genuinely
+//     doesn't exist; a stale Plex scan or config error).
+//   - If {number} is configured but currently has no matched upstream URL, or
+//     the upstream is unreachable/erroring, responds 503 (temporarily
+//     unavailable; normal/transient, does not imply a rescan is needed).
+//   - If the upstream is an HLS playlist (by Content-Type or .m3u8/.m3u
+//     extension), the response is remuxed to MPEG-TS via ffmpeg. Otherwise the
+//     upstream body is passed through as-is.
+//
+// The underlying upstream connection (and ffmpeg process, for HLS) is shared
+// with any other request currently tuned to the same channel number.
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	number := strings.TrimPrefix(r.URL.Path, "/stream/")
 
@@ -76,35 +99,49 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, upstreamURL, nil)
-	if err != nil {
-		http.Error(w, "bad upstream url", http.StatusServiceUnavailable)
+	s, ch, ok := h.getOrCreateSession(number, upstreamURL)
+	if !ok {
+		// Rare race: an existing session ended right as we tried to join
+		// it. The client (or Plex) will retry, establishing a fresh
+		// session.
+		http.Error(w, "channel temporarily unavailable", http.StatusServiceUnavailable)
 		return
 	}
-	req.Header.Set("User-Agent", upstreamUserAgent)
-	if rng := r.Header.Get("Range"); rng != "" {
-		req.Header.Set("Range", rng)
+
+	select {
+	case <-s.ready:
+	case <-r.Context().Done():
+		h.unsubscribe(number, s, ch)
+		return
 	}
 
-	resp, err := h.client.Do(req)
-	if err != nil {
+	if s.err != nil {
+		h.unsubscribe(number, s, ch)
 		http.Error(w, "upstream error", http.StatusServiceUnavailable)
 		return
 	}
-	defer resp.Body.Close()
+	defer h.unsubscribe(number, s, ch)
 
-	if resp.StatusCode >= 400 {
-		http.Error(w, "upstream error", http.StatusServiceUnavailable)
-		return
+	w.Header().Set("Content-Type", s.contentType)
+	w.WriteHeader(http.StatusOK)
+
+	flusher, _ := w.(http.Flusher)
+	for {
+		select {
+		case chunk, open := <-ch:
+			if !open {
+				return
+			}
+			if _, err := w.Write(chunk); err != nil {
+				return
+			}
+			if flusher != nil {
+				flusher.Flush()
+			}
+		case <-r.Context().Done():
+			return
+		}
 	}
-
-	if isHLS(upstreamURL, resp.Header.Get("Content-Type")) {
-		resp.Body.Close()
-		remuxToMPEGTS(w, r, upstreamURL)
-		return
-	}
-
-	passthrough(w, resp)
 }
 
 // isHLS reports whether the upstream response looks like an HLS playlist
@@ -121,97 +158,4 @@ func isHLS(upstreamURL, contentType string) bool {
 		}
 	}
 	return false
-}
-
-// passthrough copies resp's body directly to w, forwarding a small set of
-// streaming-relevant headers.
-func passthrough(w http.ResponseWriter, resp *http.Response) {
-	for _, header := range []string{"Content-Type", "Content-Length", "Content-Range", "Accept-Ranges"} {
-		if v := resp.Header.Get(header); v != "" {
-			w.Header().Set(header, v)
-		}
-	}
-	if resp.Header.Get("Content-Type") == "" {
-		w.Header().Set("Content-Type", "video/mp2t")
-	}
-	w.WriteHeader(resp.StatusCode)
-
-	flusher, _ := w.(http.Flusher)
-	buf := make([]byte, copyBufferSize)
-	for {
-		n, readErr := resp.Body.Read(buf)
-		if n > 0 {
-			if _, writeErr := w.Write(buf[:n]); writeErr != nil {
-				return
-			}
-			if flusher != nil {
-				flusher.Flush()
-			}
-		}
-		if readErr != nil {
-			return
-		}
-	}
-}
-
-// remuxToMPEGTS runs ffmpeg to remux upstreamURL (an HLS playlist) into a
-// continuous MPEG-TS stream and copies its stdout to w. ffmpeg is killed
-// when r's context is done (e.g. the client disconnects).
-//
-// Video is passed through unmodified (-c:v copy). Audio is re-encoded to
-// AC-3: Plex's HDHomeRun tuner emulation expects ATSC-style AC-3 audio, and
-// fails to tune (codecpar sample_rate/channels never populate, "sample rate
-// not set") when the audio is AAC, even when copied byte-for-byte from a
-// well-formed source. -re paces ffmpeg's reads at the input's real-time
-// rate so the output stream matches a real tuner's steady bitrate rather
-// than arriving in bursts.
-func remuxToMPEGTS(w http.ResponseWriter, r *http.Request, upstreamURL string) {
-	cmd := exec.CommandContext(r.Context(), ffmpegPath,
-		"-hide_banner", "-loglevel", "error",
-		"-user_agent", upstreamUserAgent,
-		"-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "5",
-		"-re",
-		"-i", upstreamURL,
-		"-c:v", "copy",
-		"-c:a", "ac3", "-b:a", "192k",
-		"-f", "mpegts",
-		"-",
-	)
-
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		http.Error(w, "remux setup failed", http.StatusServiceUnavailable)
-		return
-	}
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
-
-	if err := cmd.Start(); err != nil {
-		http.Error(w, "remux unavailable", http.StatusServiceUnavailable)
-		return
-	}
-
-	w.Header().Set("Content-Type", "video/mp2t")
-	w.WriteHeader(http.StatusOK)
-
-	flusher, _ := w.(http.Flusher)
-	buf := make([]byte, copyBufferSize)
-	for {
-		n, readErr := stdout.Read(buf)
-		if n > 0 {
-			if _, writeErr := w.Write(buf[:n]); writeErr != nil {
-				break
-			}
-			if flusher != nil {
-				flusher.Flush()
-			}
-		}
-		if readErr != nil {
-			break
-		}
-	}
-
-	if err := cmd.Wait(); err != nil && r.Context().Err() == nil {
-		log.Printf("stream remux for %s: ffmpeg exited: %v: %s", upstreamURL, err, strings.TrimSpace(stderr.String()))
-	}
 }
