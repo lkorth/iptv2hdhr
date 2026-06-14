@@ -42,7 +42,32 @@ copied byte-for-byte.
 
 ## Running with real Plex
 
-1. Build and run the production image:
+1. Run the image. Tagged releases are published to the GitHub
+   Container Registry as `ghcr.io/lkorth/iptv2hdhr:<version>` (see
+   [Releases](https://github.com/lkorth/iptv2hdhr/releases) for available
+   versions) — using `docker compose`:
+
+   ```yaml
+   # docker-compose.yml
+   services:
+     iptv2hdhr:
+       image: ghcr.io/lkorth/iptv2hdhr:1.0.0
+       container_name: iptv2hdhr
+       network_mode: host
+       volumes:
+         - /path/to/data:/data
+       restart: unless-stopped
+   ```
+
+   ```sh
+   docker compose up -d
+   ```
+
+   `/path/to/data` must contain `config.yaml`. `network_mode: host` is
+   recommended so SSDP (UDP multicast) auto-discovery works; without it, add
+   the tuner to Plex manually by IP:port.
+
+   Alternatively, build the image from source:
 
    ```sh
    docker build -t iptv2hdhr .
@@ -50,10 +75,6 @@ copied byte-for-byte.
      -v /path/to/data:/data \
      iptv2hdhr
    ```
-
-   `/path/to/data` must contain `config.yaml`. `--network host` is
-   recommended so SSDP (UDP multicast) auto-discovery works; without it, add
-   the tuner to Plex manually by IP:port.
 
 2. In Plex: **Settings → Live TV & DVR → Set up Plex DVR**. It should
    auto-discover the tuner via SSDP (by `device.friendly_name`), or add
