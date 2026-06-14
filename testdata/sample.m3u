@@ -1,0 +1,12 @@
+#EXTM3U
+#EXTINF:-1 tvg-id="ESPN.us" tvg-name="ESPN" tvg-logo="http://example.com/espn.png" group-title="Sports",ESPN HD
+http://example.com/streams/espn
+#EXTINF:-1 tvg-id="CNN.us" tvg-name="CNN International" group-title="News",CNN
+http://example.com/streams/cnn
+#EXTINF:-1 tvg-name="Local News, Channel 5" group-title="Local",Local News 5
+http://example.com/streams/local5
+#EXTINF:-1 tvg-id="NONAME.us" group-title="Misc"
+http://example.com/streams/noname
+#EXTINF:-1 tvg-id="ORPHAN.us" tvg-name="Orphan Channel",Orphan
+#EXTINF:-1 tvg-id="LASTCH.us" tvg-name="Last Channel",Last Channel HD
+http://example.com/streams/last

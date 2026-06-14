@@ -1,0 +1,50 @@
+# Config for manual end-to-end verification (see README "Manual
+# verification" section). Uses file:// URLs to read the sample fixtures
+# directly, so no network access is required.
+#
+# Run from the repo root:
+#   ./dev.sh run ./cmd/iptv2hdhr -config testdata/sample-config.yaml
+
+device:
+  friendly_name: "IPTV Tuner (dev)"
+  device_id: "ABCD1234"
+  http_port: 8080
+
+playlists:
+  - name: "sample"
+    url: "file://testdata/sample.m3u"
+    refresh_interval: 1m
+
+guides:
+  - name: "sample"
+    url: "file://testdata/sample-guide.xml"
+    refresh_interval: 1m
+
+channels:
+  # Matches sample.m3u's ESPN HD entry and sample-guide.xml's ESPN.us
+  # programmes -> 200 with real guide data.
+  - number: "1001"
+    name: "ESPN HD"
+    logo: "http://example.com/espn.png"
+    tvg_id: "ESPN.us"
+
+  # Matches sample.m3u's CNN entry and sample-guide.xml's CNN.us programme.
+  - number: "1002"
+    name: "CNN International"
+    tvg_id: "CNN.us"
+
+  # Matches sample.m3u's "Local News 5" entry by name (no tvg-id in the
+  # source); no guide data -> filler in /guide.xml.
+  - number: "1003"
+    name: "Local News 5"
+    name_match: "Local News"
+
+  # Matches sample.m3u's "Last Channel HD" entry; no guide data -> filler.
+  - number: "1004"
+    name: "Last Channel HD"
+    tvg_id: "LASTCH.us"
+
+  # Configured but matches nothing in sample.m3u -> /stream/2001 returns 503.
+  - number: "2001"
+    name: "Unmatched Channel"
+    tvg_id: "NOPE.us"

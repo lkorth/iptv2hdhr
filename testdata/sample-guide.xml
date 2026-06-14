@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<tv generator-info-name="sample">
+  <channel id="ESPN.us">
+    <display-name>ESPN</display-name>
+    <icon src="http://example.com/espn.png"/>
+  </channel>
+  <channel id="CNN.us">
+    <display-name>CNN International</display-name>
+  </channel>
+  <programme channel="ESPN.us" start="20240613180000 +0000" stop="20240613190000 +0000">
+    <title lang="en">SportsCenter</title>
+    <desc lang="en">Highlights and analysis.</desc>
+    <category lang="en">Sports</category>
+  </programme>
+  <programme channel="ESPN.us" start="20240613190000 +0000" stop="20240613210000 +0000">
+    <title lang="en">NBA Basketball</title>
+    <sub-title lang="en">Lakers at Celtics</sub-title>
+    <desc lang="en">Regular season game.</desc>
+  </programme>
+  <programme channel="CNN.us" start="20240613170000 +0000" stop="20240613180000 +0000">
+    <title lang="en">CNN Newsroom</title>
+  </programme>
+</tv>

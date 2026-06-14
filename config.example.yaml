@@ -1,0 +1,65 @@
+# Example configuration for the tuner service. Copy this to config.yaml and
+# edit to match your IPTV provider(s) and desired channel lineup.
+#
+# The "channels" list below is the STABLE LINEUP: it always defines exactly
+# what /lineup.json reports (same numbers, names, and order, every time),
+# regardless of what's currently in the playlists. Add/remove/reorder
+# channels here only when you're prepared for Plex to need a rescan.
+
+device:
+  friendly_name: "IPTV Tuner"
+  manufacturer: "Silicondust"
+  model_number: "HDTC-2US"
+  # Plex's stable identity for this tuner (HDHomeRun "DeviceID"/UDN). Must be
+  # 8 hex characters. Generate one (e.g. `head -c4 /dev/urandom | xxd -p`,
+  # uppercased) and set it once -- changing it later makes Plex treat this as
+  # a brand new tuner.
+  device_id: "12345678"
+  tuner_count: 4
+  http_port: 8080
+  # Set this if auto-detection of the host's IP picks the wrong network
+  # interface (common in Docker). Used for SSDP and for the URLs returned
+  # in /discover.json and /lineup.json.
+  # base_url: "http://192.168.1.50:8080"
+
+playlists:
+  - name: "main"
+    url: "https://example.com/playlist.m3u"
+    refresh_interval: 30m
+
+  # Multiple playlists are merged together; entries are matched against
+  # "channels" below by tvg_id (preferred) or name_match.
+  # - name: "backup"
+  #   url: "https://example.com/backup.m3u"
+  #   refresh_interval: 1h
+
+guides:
+  - name: "main"
+    url: "https://example.com/guide.xml.gz"
+    refresh_interval: 1h
+
+  # Guides are optional. Channels with no matching guide data (or no guides
+  # configured at all) show a "No Program Information Available" filler in
+  # /guide.xml.
+
+channels:
+  - number: "1001"
+    name: "ESPN HD"
+    logo: "http://example.com/espn.png"
+    tvg_id: "ESPN.us"
+
+  - number: "1002"
+    name: "CNN International"
+    tvg_id: "CNN.us"
+
+  - number: "1003"
+    name: "Local News 5"
+    # Fallback match when the playlist entry has no tvg-id: matches any
+    # entry whose name or tvg-name contains this substring (case-insensitive).
+    name_match: "Local News"
+
+  # A channel slot with no tvg_id and no name_match is valid: it always
+  # returns 503 on /stream/, reserving the slot for later without ever
+  # changing the lineup shape.
+  - number: "1004"
+    name: "Reserved"
