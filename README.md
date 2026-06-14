@@ -31,6 +31,15 @@ transparently regardless of `Content-Encoding`.
 "DeviceID"/UDN). Set it once and never change it once Plex has discovered
 the tuner, or Plex will treat it as a brand new device.
 
+`/stream/{number}` automatically remuxes HLS upstreams (`.m3u8`) to MPEG-TS
+via `ffmpeg` (bundled in the Docker image), since HDHomeRun clients expect a
+continuous MPEG-TS stream rather than an HLS manifest. Upstreams that are
+already MPEG-TS are passed through directly with no ffmpeg overhead. For HLS
+upstreams, video is passed through unchanged but audio is re-encoded to AC-3
+(at real-time pace) — Plex's HDHomeRun tuner emulation expects ATSC-style
+AC-3 audio and fails to tune ("Could not tune channel") with AAC, even if
+copied byte-for-byte.
+
 ## Running with real Plex
 
 1. Build and run the production image:
@@ -76,13 +85,6 @@ the tuner, or Plex will treat it as a brand new device.
    theirs), restart, and confirm Plex's channel list and numbers are
    unchanged — channels whose matches disappeared simply show as
    unavailable rather than vanishing.
-
-## Future work
-
-- **ffmpeg remux**: currently uses raw HTTP passthrough for `/stream/{number}`. The
-  Docker image already includes `ffmpeg` for when a per-channel `remux: true`
-  option is added to pipe non-conformant upstream streams through
-  `ffmpeg -i <upstream> -c copy -f mpegts -`.
 
 ## Development
 
