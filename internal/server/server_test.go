@@ -1,9 +1,11 @@
 package server
 
 import (
+	"compress/gzip"
 	"context"
 	"encoding/json"
 	"encoding/xml"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -145,6 +147,39 @@ func TestServer_GuideXML(t *testing.T) {
 	}
 	if doc.Channels[0].ID != "slot-1001" {
 		t.Errorf("doc.Channels[0].ID = %q, want %q", doc.Channels[0].ID, "slot-1001")
+	}
+}
+
+func TestServer_GuideXML_Gzip(t *testing.T) {
+	srv := newTestServer(t)
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest("GET", "/guide.xml", nil)
+	r.Header.Set("Accept-Encoding", "gzip")
+	srv.ServeHTTP(w, r)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", w.Code, http.StatusOK)
+	}
+	if ce := w.Header().Get("Content-Encoding"); ce != "gzip" {
+		t.Fatalf("Content-Encoding = %q, want %q", ce, "gzip")
+	}
+
+	gz, err := gzip.NewReader(w.Body)
+	if err != nil {
+		t.Fatalf("gzip.NewReader: %v", err)
+	}
+	defer gz.Close()
+	decoded, err := io.ReadAll(gz)
+	if err != nil {
+		t.Fatalf("reading gzip body: %v", err)
+	}
+
+	doc, err := xmltv.Parse(decoded)
+	if err != nil {
+		t.Fatalf("xmltv.Parse: %v\nbody: %s", err, decoded)
+	}
+	if len(doc.Channels) != 2 {
+		t.Fatalf("len(doc.Channels) = %d, want 2", len(doc.Channels))
 	}
 }
 

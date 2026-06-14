@@ -3,8 +3,10 @@
 package server
 
 import (
+	"compress/gzip"
 	"context"
 	"net/http"
+	"strings"
 	"time"
 
 	"iptv2hdhr/internal/config"
@@ -44,7 +46,10 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	s.mux.ServeHTTP(w, r)
 }
 
-// guideHandler serves /guide.xml, generated fresh on every request.
+// guideHandler serves /guide.xml, generated fresh on every request. XMLTV
+// guides can run into the tens of megabytes for a full lineup, so the
+// response is gzip-compressed when the client (Plex) advertises support for
+// it.
 func guideHandler(lin *lineup.Lineup, gf *guide.Fetcher) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		data, err := guide.BuildGuideXML(lin.Current(), gf.Current(), time.Now())
@@ -53,6 +58,13 @@ func guideHandler(lin *lineup.Lineup, gf *guide.Fetcher) http.HandlerFunc {
 			return
 		}
 		w.Header().Set("Content-Type", "application/xml")
+		if strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") {
+			w.Header().Set("Content-Encoding", "gzip")
+			gz := gzip.NewWriter(w)
+			gz.Write(data)
+			gz.Close()
+			return
+		}
 		w.Write(data)
 	}
 }
