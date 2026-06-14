@@ -19,6 +19,12 @@ import (
 // without bound.
 const subscriberQueueSize = 64
 
+// ffmpegStartupTimeout bounds how long we wait for ffmpeg to produce its
+// first output bytes when remuxing an HLS upstream. If exceeded, the
+// channel is reported unavailable (503) rather than leaving the client
+// waiting indefinitely on a stuck process.
+const ffmpegStartupTimeout = 15 * time.Second
+
 // idleSessionGrace is how long a session with no subscribers is kept alive
 // (upstream connection / ffmpeg process still running) before being torn
 // down, so a client that quickly reconnects (channel surf, brief blip)
@@ -266,6 +272,10 @@ func (s *session) pump(r io.Reader) {
 // well-formed source. -re paces ffmpeg's reads at the input's real-time rate
 // so the output stream matches a real tuner's steady bitrate rather than
 // arriving in bursts.
+//
+// If ffmpeg doesn't produce any output within ffmpegStartupTimeout, it's
+// killed and the channel is reported unavailable rather than leaving
+// subscribers waiting on a stuck process.
 func (s *session) runRemux(ctx context.Context) {
 	cmd := exec.CommandContext(ctx, ffmpegPath,
 		"-hide_banner", "-loglevel", "error",
@@ -293,7 +303,7 @@ func (s *session) runRemux(ctx context.Context) {
 	}
 
 	buf := make([]byte, copyBufferSize)
-	n, err := stdout.Read(buf)
+	n, err := readWithTimeout(stdout, buf, ffmpegStartupTimeout)
 	if err != nil {
 		cmd.Process.Kill()
 		cmd.Wait()
@@ -311,5 +321,25 @@ func (s *session) runRemux(ctx context.Context) {
 
 	if err := cmd.Wait(); err != nil && ctx.Err() == nil {
 		log.Printf("stream remux for %s: ffmpeg exited: %v: %s", s.upstreamURL, err, strings.TrimSpace(stderr.String()))
+	}
+}
+
+// readWithTimeout reads from r into buf, returning an error if no read
+// completes within timeout.
+func readWithTimeout(r io.Reader, buf []byte, timeout time.Duration) (int, error) {
+	type result struct {
+		n   int
+		err error
+	}
+	resCh := make(chan result, 1)
+	go func() {
+		n, err := r.Read(buf)
+		resCh <- result{n, err}
+	}()
+	select {
+	case res := <-resCh:
+		return res.n, res.err
+	case <-time.After(timeout):
+		return 0, fmt.Errorf("timed out after %s", timeout)
 	}
 }
