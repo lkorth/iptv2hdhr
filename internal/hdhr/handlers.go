@@ -16,9 +16,9 @@ type Deps struct {
 	Lineup *lineup.Lineup
 }
 
-// baseURL returns the externally-visible base URL for this server, used to
-// build absolute links in discovery responses.
-func baseURL(cfg *config.Config, r *http.Request) string {
+// BaseURL returns the externally-visible base URL for this server, used to
+// build absolute links in discovery responses and the guide.
+func BaseURL(cfg *config.Config, r *http.Request) string {
 	if cfg.Device.BaseURL != "" {
 		return cfg.Device.BaseURL
 	}
@@ -27,7 +27,7 @@ func baseURL(cfg *config.Config, r *http.Request) string {
 
 // DiscoverHandler serves /discover.json.
 func (d *Deps) DiscoverHandler(w http.ResponseWriter, r *http.Request) {
-	base := baseURL(d.Cfg, r)
+	base := BaseURL(d.Cfg, r)
 	resp := Discover{
 		FriendlyName:    d.Cfg.Device.FriendlyName,
 		ModelNumber:     d.Cfg.Device.ModelNumber,
@@ -58,7 +58,7 @@ func (d *Deps) LineupStatusHandler(w http.ResponseWriter, r *http.Request) {
 // same length, order, GuideNumber, and GuideName as the configured channel
 // list, regardless of current playlist match state.
 func (d *Deps) LineupHandler(w http.ResponseWriter, r *http.Request) {
-	base := baseURL(d.Cfg, r)
+	base := BaseURL(d.Cfg, r)
 	channels := d.Lineup.Channels()
 
 	out := make([]LineupEntry, 0, len(channels))
@@ -80,7 +80,7 @@ func (d *Deps) LineupPostHandler(w http.ResponseWriter, r *http.Request) {
 
 // DeviceXMLHandler serves /device.xml, the UPnP device description.
 func (d *Deps) DeviceXMLHandler(w http.ResponseWriter, r *http.Request) {
-	base := baseURL(d.Cfg, r)
+	base := BaseURL(d.Cfg, r)
 
 	var c Capability
 	c.Xmlns = "urn:schemas-upnp-org:device-1-0"

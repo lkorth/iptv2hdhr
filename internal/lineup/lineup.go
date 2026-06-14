@@ -81,6 +81,16 @@ func (l *Lineup) Current() *Snapshot {
 	return l.current.Load()
 }
 
+// ChannelByNumber returns the configured channel for number, or ok=false if
+// no channel with that number is configured.
+func (l *Lineup) ChannelByNumber(number string) (ch Channel, ok bool) {
+	idx, ok := l.numberIndex[number]
+	if !ok {
+		return Channel{}, false
+	}
+	return l.channels[idx], true
+}
+
 // StreamURL looks up the current matched upstream URL for a configured
 // channel number. ok is false if the number isn't configured at all, or if
 // it's configured but currently has no match.

@@ -13,6 +13,7 @@ import (
 	"iptv2hdhr/internal/guide"
 	"iptv2hdhr/internal/hdhr"
 	"iptv2hdhr/internal/lineup"
+	"iptv2hdhr/internal/logoproxy"
 	"iptv2hdhr/internal/streamproxy"
 )
 
@@ -34,9 +35,10 @@ func New(ctx context.Context, cfg *config.Config, lin *lineup.Lineup, gf *guide.
 	mux.HandleFunc("/lineup.post", deps.LineupPostHandler)
 	mux.HandleFunc("/device.xml", deps.DeviceXMLHandler)
 
-	mux.HandleFunc("/guide.xml", guideHandler(lin, gf))
+	mux.HandleFunc("/guide.xml", guideHandler(cfg, lin, gf))
 
 	mux.Handle("/stream/", streamproxy.New(lin, ctx))
+	mux.Handle("/logo/", logoproxy.New(lin))
 
 	return &Server{mux: mux}
 }
@@ -50,9 +52,10 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // guides can run into the tens of megabytes for a full lineup, so the
 // response is gzip-compressed when the client (Plex) advertises support for
 // it.
-func guideHandler(lin *lineup.Lineup, gf *guide.Fetcher) http.HandlerFunc {
+func guideHandler(cfg *config.Config, lin *lineup.Lineup, gf *guide.Fetcher) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		data, err := guide.BuildGuideXML(lin.Current(), gf.Current(), time.Now())
+		base := hdhr.BaseURL(cfg, r)
+		data, err := guide.BuildGuideXML(lin.Current(), gf.Current(), time.Now(), base)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return

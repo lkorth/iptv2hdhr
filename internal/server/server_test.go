@@ -33,7 +33,7 @@ func newTestServer(t *testing.T) *Server {
 	}
 
 	lin, err := lineup.New([]config.Channel{
-		{Number: "1001", Name: "ESPN HD", TvgID: "ESPN.us"},
+		{Number: "1001", Name: "ESPN HD", Logo: "http://example.com/espn.png", TvgID: "ESPN.us"},
 		{Number: "1004", Name: "Reserved Slot"},
 	})
 	if err != nil {
@@ -148,6 +148,9 @@ func TestServer_GuideXML(t *testing.T) {
 	if doc.Channels[0].ID != "slot-1001" {
 		t.Errorf("doc.Channels[0].ID = %q, want %q", doc.Channels[0].ID, "slot-1001")
 	}
+	if doc.Channels[0].Icon == nil || doc.Channels[0].Icon.Src != "http://example.com/logo/1001" {
+		t.Errorf("doc.Channels[0].Icon = %+v, want src %q", doc.Channels[0].Icon, "http://example.com/logo/1001")
+	}
 }
 
 func TestServer_GuideXML_Gzip(t *testing.T) {
@@ -187,6 +190,17 @@ func TestServer_StreamUnknownChannel404(t *testing.T) {
 	srv := newTestServer(t)
 	w := httptest.NewRecorder()
 	r := httptest.NewRequest("GET", "/stream/9999", nil)
+	srv.ServeHTTP(w, r)
+
+	if w.Code != http.StatusNotFound {
+		t.Errorf("status = %d, want %d", w.Code, http.StatusNotFound)
+	}
+}
+
+func TestServer_LogoUnknownChannel404(t *testing.T) {
+	srv := newTestServer(t)
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest("GET", "/logo/9999", nil)
 	srv.ServeHTTP(w, r)
 
 	if w.Code != http.StatusNotFound {

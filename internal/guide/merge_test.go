@@ -26,7 +26,7 @@ func TestBuildGuideXML(t *testing.T) {
 		},
 	}
 
-	data, err := BuildGuideXML(snap, idx, testNow)
+	data, err := BuildGuideXML(snap, idx, testNow, "http://192.168.1.50:8080")
 	if err != nil {
 		t.Fatalf("BuildGuideXML returned error: %v", err)
 	}
@@ -42,8 +42,8 @@ func TestBuildGuideXML(t *testing.T) {
 	if doc.Channels[0].ID != "slot-1001" {
 		t.Errorf("doc.Channels[0].ID = %q, want %q", doc.Channels[0].ID, "slot-1001")
 	}
-	if doc.Channels[0].Icon == nil || doc.Channels[0].Icon.Src != "http://example.com/espn.png" {
-		t.Errorf("doc.Channels[0].Icon = %+v, want src %q", doc.Channels[0].Icon, "http://example.com/espn.png")
+	if doc.Channels[0].Icon == nil || doc.Channels[0].Icon.Src != "http://192.168.1.50:8080/logo/1001" {
+		t.Errorf("doc.Channels[0].Icon = %+v, want src %q", doc.Channels[0].Icon, "http://192.168.1.50:8080/logo/1001")
 	}
 	if doc.Channels[1].ID != "slot-1004" {
 		t.Errorf("doc.Channels[1].ID = %q, want %q", doc.Channels[1].ID, "slot-1004")
