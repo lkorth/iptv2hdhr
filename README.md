@@ -53,16 +53,25 @@ the tuner, or Plex will treat it as a brand new device.
 3. Run the channel scan once — this is the only time `/lineup.json` is
    snapshotted by Plex.
 
-4. Add the guide: in the tuner's settings in Plex, set the EPG source to
-   `http://<host>:<port>/guide.xml`. Note: if this option is not present
-   it may be hidden because you are using Plex sourced EPGs, you need to
-   remove all other tuners and re-add them using an XML EPG in order to use
-   this option.
+4. Add the guide: after the channel scan, Plex's setup wizard shows a "Guide"
+   step that defaults to Plex's zip-code-based guide data. Look for a link
+   such as "Use an XMLTV guide on the network" (or similar wording — it's a
+   small text link, not a button) and enter
+   `http://<host>:<port>/guide.xml` there. Note: if this option is not
+   present it may be hidden because you are using Plex sourced EPGs, you need
+   to remove all other tuners and re-add them using an XML EPG in order to use
+   this option. Plex only supports one XMLTV source for all DVR tuners.
 
 5. Confirm the guide grid populates (real programmes where available,
    filler elsewhere).
 
-6. To verify the stability guarantee: change `playlists[].url` to point at a
+6. By default Plex only refreshes the XMLTV guide once every 24 hours. If
+   your guide sources refresh more often than that (per `guides[].refresh_interval`
+   in `config.yaml`), edit the DVR's settings in Plex (the gear/edit icon next
+   to the tuner under **Settings → Live TV & DVR**) and lower "Refresh guide
+   every" to match, so Plex picks up new programme data sooner.
+
+7. To verify the stability guarantee: change `playlists[].url` to point at a
    different/reshuffled upstream M3U (or wait for the provider to update
    theirs), restart, and confirm Plex's channel list and numbers are
    unchanged — channels whose matches disappeared simply show as
