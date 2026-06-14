@@ -1,0 +1,18 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "if ./dev.sh test ./...; then exit 0; else echo 'Tests failed - commit blocked. Fix failing tests before committing.' >&2; exit 2; fi",
+            "if": "Bash(git commit*)",
+            "timeout": 300,
+            "statusMessage": "Running test suite before commit..."
+          }
+        ]
+      }
+    ]
+  }
+}
