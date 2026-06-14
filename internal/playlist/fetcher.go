@@ -19,8 +19,10 @@ type Fetcher struct {
 	sources []config.PlaylistSource
 	client  *http.Client
 
-	mu       sync.Mutex
-	lastGood map[string][]Entry // by source name; preserved across failed refreshes
+	mu            sync.Mutex
+	lastGood      map[string][]Entry // by source name; preserved across failed refreshes
+	etags         map[string]string  // by source name; for conditional refetches
+	lastModifieds map[string]string  // by source name; for conditional refetches
 
 	current atomic.Pointer[[]Entry]
 }
@@ -29,9 +31,11 @@ type Fetcher struct {
 // RefreshNow once before Start so Current() returns data immediately.
 func NewFetcher(sources []config.PlaylistSource) *Fetcher {
 	return &Fetcher{
-		sources:  sources,
-		client:   &http.Client{Timeout: 60 * time.Second},
-		lastGood: make(map[string][]Entry),
+		sources:       sources,
+		client:        &http.Client{Timeout: 60 * time.Second},
+		lastGood:      make(map[string][]Entry),
+		etags:         make(map[string]string),
+		lastModifieds: make(map[string]string),
 	}
 }
 
@@ -81,13 +85,21 @@ func (f *Fetcher) Start(ctx context.Context, onUpdate func([]Entry)) {
 }
 
 func (f *Fetcher) refreshSource(ctx context.Context, src config.PlaylistSource) {
-	data, err := fetchutil.Get(ctx, f.client, src.URL)
+	f.mu.Lock()
+	etag, lastModified := f.etags[src.Name], f.lastModifieds[src.Name]
+	f.mu.Unlock()
+
+	result, err := fetchutil.GetConditional(ctx, f.client, src.URL, etag, lastModified)
 	if err != nil {
 		log.Printf("playlist %q: fetch failed: %v", src.Name, err)
 		return
 	}
+	if result.NotModified {
+		log.Printf("playlist %q: not modified, keeping previous entries", src.Name)
+		return
+	}
 
-	entries, err := Parse(data)
+	entries, err := Parse(result.Data)
 	if err != nil {
 		log.Printf("playlist %q: parse failed: %v", src.Name, err)
 		return
@@ -95,6 +107,8 @@ func (f *Fetcher) refreshSource(ctx context.Context, src config.PlaylistSource) 
 
 	f.mu.Lock()
 	f.lastGood[src.Name] = entries
+	f.etags[src.Name] = result.ETag
+	f.lastModifieds[src.Name] = result.LastModified
 	f.mu.Unlock()
 
 	log.Printf("playlist %q: loaded %d entries", src.Name, len(entries))

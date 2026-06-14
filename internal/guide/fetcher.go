@@ -41,8 +41,10 @@ type Fetcher struct {
 	sources []config.GuideSource
 	client  *http.Client
 
-	mu       sync.Mutex
-	lastGood map[string]*xmltv.Document // by source name; preserved across failed refreshes
+	mu            sync.Mutex
+	lastGood      map[string]*xmltv.Document // by source name; preserved across failed refreshes
+	etags         map[string]string          // by source name; for conditional refetches
+	lastModifieds map[string]string          // by source name; for conditional refetches
 
 	current atomic.Pointer[Index]
 }
@@ -51,9 +53,11 @@ type Fetcher struct {
 // once before Start so Current() returns useful data immediately.
 func NewFetcher(sources []config.GuideSource) *Fetcher {
 	f := &Fetcher{
-		sources:  sources,
-		client:   &http.Client{Timeout: 60 * time.Second},
-		lastGood: make(map[string]*xmltv.Document),
+		sources:       sources,
+		client:        &http.Client{Timeout: 60 * time.Second},
+		lastGood:      make(map[string]*xmltv.Document),
+		etags:         make(map[string]string),
+		lastModifieds: make(map[string]string),
 	}
 	f.current.Store(emptyIndex())
 	return f
@@ -97,13 +101,21 @@ func (f *Fetcher) Start(ctx context.Context) {
 }
 
 func (f *Fetcher) refreshSource(ctx context.Context, src config.GuideSource) {
-	data, err := fetchutil.Get(ctx, f.client, src.URL)
+	f.mu.Lock()
+	etag, lastModified := f.etags[src.Name], f.lastModifieds[src.Name]
+	f.mu.Unlock()
+
+	result, err := fetchutil.GetConditional(ctx, f.client, src.URL, etag, lastModified)
 	if err != nil {
 		log.Printf("guide %q: fetch failed: %v", src.Name, err)
 		return
 	}
+	if result.NotModified {
+		log.Printf("guide %q: not modified, keeping previous data", src.Name)
+		return
+	}
 
-	doc, err := xmltv.Parse(data)
+	doc, err := xmltv.Parse(result.Data)
 	if err != nil {
 		log.Printf("guide %q: parse failed: %v", src.Name, err)
 		return
@@ -111,6 +123,8 @@ func (f *Fetcher) refreshSource(ctx context.Context, src config.GuideSource) {
 
 	f.mu.Lock()
 	f.lastGood[src.Name] = doc
+	f.etags[src.Name] = result.ETag
+	f.lastModifieds[src.Name] = result.LastModified
 	f.mu.Unlock()
 
 	log.Printf("guide %q: loaded %d channels, %d programmes", src.Name, len(doc.Channels), len(doc.Programmes))

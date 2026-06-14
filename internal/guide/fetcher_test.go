@@ -83,6 +83,43 @@ func TestFetcher_RefreshNow_MergesMultipleSources(t *testing.T) {
 	}
 }
 
+func TestFetcher_RefreshNow_ConditionalRequestSkipsUnchanged(t *testing.T) {
+	var requests int
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		if r.Header.Get("If-None-Match") == `"v1"` {
+			w.WriteHeader(http.StatusNotModified)
+			return
+		}
+		w.Header().Set("ETag", `"v1"`)
+		if requests == 1 {
+			w.Write([]byte(guideASource)) // 2 programmes for ESPN.us
+		} else {
+			w.Write([]byte(guideBSource)) // CNN.us only
+		}
+	}))
+	defer srv.Close()
+
+	f := NewFetcher([]config.GuideSource{{Name: "a", URL: srv.URL}})
+
+	f.RefreshNow(context.Background())
+	if len(f.Current().ProgrammesByChannelID["ESPN.us"]) != 2 {
+		t.Fatalf("after first refresh: ProgrammesByChannelID[ESPN.us] = %+v, want 2 entries", f.Current().ProgrammesByChannelID["ESPN.us"])
+	}
+
+	// Second refresh: server reports 304 Not Modified for the etag we
+	// learned from the first response, so the (different) body it would
+	// otherwise serve must not be parsed.
+	f.RefreshNow(context.Background())
+	if requests != 2 {
+		t.Fatalf("requests = %d, want 2", requests)
+	}
+	if len(f.Current().ProgrammesByChannelID["ESPN.us"]) != 2 {
+		t.Errorf("after second (not-modified) refresh: ProgrammesByChannelID[ESPN.us] = %+v, want last-good 2 entries preserved", f.Current().ProgrammesByChannelID["ESPN.us"])
+	}
+}
+
 func TestFetcher_RefreshNow_PreservesLastGoodOnFailure(t *testing.T) {
 	var fail atomic.Bool
 

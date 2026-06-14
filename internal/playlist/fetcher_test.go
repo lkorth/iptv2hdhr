@@ -111,6 +111,43 @@ func TestFetcher_RefreshNow_PreservesLastGoodOnFailure(t *testing.T) {
 	}
 }
 
+func TestFetcher_RefreshNow_ConditionalRequestSkipsUnchanged(t *testing.T) {
+	var requests int
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		if r.Header.Get("If-None-Match") == `"v1"` {
+			w.WriteHeader(http.StatusNotModified)
+			return
+		}
+		w.Header().Set("ETag", `"v1"`)
+		if requests == 1 {
+			w.Write([]byte(sourceAPlaylist)) // 1 entry
+		} else {
+			w.Write([]byte(sourceAPlaylistUpdated)) // 2 entries
+		}
+	}))
+	defer srv.Close()
+
+	f := NewFetcher([]config.PlaylistSource{{Name: "a", URL: srv.URL}})
+
+	f.RefreshNow(context.Background())
+	if len(f.Current()) != 1 {
+		t.Fatalf("after first refresh: len(entries) = %d, want 1: %+v", len(f.Current()), f.Current())
+	}
+
+	// Second refresh: server reports 304 Not Modified for the etag we
+	// learned from the first response, so the (different) body it would
+	// otherwise serve must not be parsed.
+	f.RefreshNow(context.Background())
+	if requests != 2 {
+		t.Fatalf("requests = %d, want 2", requests)
+	}
+	if len(f.Current()) != 1 {
+		t.Errorf("after second (not-modified) refresh: len(entries) = %d, want 1 (unchanged): %+v", len(f.Current()), f.Current())
+	}
+}
+
 func TestFetcher_RefreshNow_FetchFailureLeavesSourceEmpty(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNotFound)
