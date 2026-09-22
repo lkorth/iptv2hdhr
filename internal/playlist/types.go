@@ -8,4 +8,11 @@ type Entry struct {
 	TvgLogo    string // tvg-logo attribute
 	GroupTitle string // group-title attribute
 	URL        string // stream URL
+
+	// Headers are extra HTTP request headers to send when fetching URL (and,
+	// for HLS, its segments), keyed by canonical header name. Populated
+	// from #EXTVLCOPT:http-referrer / http-user-agent lines preceding the
+	// URL and from a Kodi-style "url|Referer=...&User-Agent=..." suffix.
+	// Nil when the entry has none.
+	Headers map[string]string
 }

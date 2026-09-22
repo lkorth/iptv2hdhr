@@ -33,10 +33,10 @@ func buildMatchIndex(entries []playlist.Entry) matchIndex {
 
 // matchChannel finds the best current playlist entry for a config channel.
 // Returns ok=false if nothing matches.
-func matchChannel(ch Channel, idx matchIndex) (url string, ok bool) {
+func matchChannel(ch Channel, idx matchIndex) (entry playlist.Entry, ok bool) {
 	if ch.TvgID != "" {
 		if e, found := idx.byTvgID[normalizeTvgID(ch.TvgID)]; found {
-			return e.URL, true
+			return e, true
 		}
 	}
 	if ch.NameMatch != "" {
@@ -44,11 +44,11 @@ func matchChannel(ch Channel, idx matchIndex) (url string, ok bool) {
 		for _, e := range idx.all {
 			if strings.Contains(strings.ToLower(e.Name), needle) ||
 				strings.Contains(strings.ToLower(e.TvgName), needle) {
-				return e.URL, true
+				return e, true
 			}
 		}
 	}
-	return "", false
+	return playlist.Entry{}, false
 }
 
 // normalizeTvgID normalizes a tvg-id for case-insensitive comparison.

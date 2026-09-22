@@ -56,8 +56,8 @@ func TestCurrent_BeforeRebuild(t *testing.T) {
 	if len(snap.Channels) != 4 {
 		t.Fatalf("snap.Channels len = %d, want 4", len(snap.Channels))
 	}
-	if len(snap.StreamURL) != 0 {
-		t.Errorf("snap.StreamURL = %v, want empty before any Rebuild", snap.StreamURL)
+	if len(snap.Streams) != 0 {
+		t.Errorf("snap.Streams = %v, want empty before any Rebuild", snap.Streams)
 	}
 }
 
@@ -72,15 +72,15 @@ func TestRebuild_MatchByTvgID_CaseInsensitive(t *testing.T) {
 	}
 	l.Rebuild(entries)
 
-	url, configured, matched := l.StreamURL("1001")
+	s, configured, matched := l.Stream("1001")
 	if !configured {
 		t.Fatal("channel 1001 should be configured")
 	}
 	if !matched {
 		t.Fatal("channel 1001 should be matched (case-insensitive tvg-id)")
 	}
-	if url != "http://example.com/espn" {
-		t.Errorf("url = %q, want %q", url, "http://example.com/espn")
+	if s.URL != "http://example.com/espn" {
+		t.Errorf("url = %q, want %q", s.URL, "http://example.com/espn")
 	}
 }
 
@@ -95,28 +95,49 @@ func TestRebuild_MatchByNameMatchFallback(t *testing.T) {
 	}
 	l.Rebuild(entries)
 
-	url, configured, matched := l.StreamURL("1003")
+	s, configured, matched := l.Stream("1003")
 	if !configured || !matched {
 		t.Fatalf("channel 1003: configured=%v matched=%v, want true,true", configured, matched)
 	}
-	if url != "http://example.com/local5" {
-		t.Errorf("url = %q, want %q", url, "http://example.com/local5")
+	if s.URL != "http://example.com/local5" {
+		t.Errorf("url = %q, want %q", s.URL, "http://example.com/local5")
 	}
 }
 
-func TestStreamURL_NotConfigured(t *testing.T) {
+func TestRebuild_CarriesEntryHeaders(t *testing.T) {
 	l, err := New(sampleConfig())
 	if err != nil {
 		t.Fatalf("New returned error: %v", err)
 	}
 
-	_, configured, _ := l.StreamURL("9999")
+	entries := []playlist.Entry{
+		{Name: "ESPN HD", TvgID: "ESPN.us", URL: "http://example.com/espn.m3u8",
+			Headers: map[string]string{"Referer": "http://example.com/"}},
+	}
+	l.Rebuild(entries)
+
+	s, _, matched := l.Stream("1001")
+	if !matched {
+		t.Fatal("channel 1001 should be matched")
+	}
+	if got := s.Headers["Referer"]; got != "http://example.com/" {
+		t.Errorf("Headers[Referer] = %q, want %q", got, "http://example.com/")
+	}
+}
+
+func TestStream_NotConfigured(t *testing.T) {
+	l, err := New(sampleConfig())
+	if err != nil {
+		t.Fatalf("New returned error: %v", err)
+	}
+
+	_, configured, _ := l.Stream("9999")
 	if configured {
 		t.Error("channel 9999 is not configured, want configured=false")
 	}
 }
 
-func TestStreamURL_ConfiguredButUnmatched(t *testing.T) {
+func TestStream_ConfiguredButUnmatched(t *testing.T) {
 	l, err := New(sampleConfig())
 	if err != nil {
 		t.Fatalf("New returned error: %v", err)
@@ -124,12 +145,12 @@ func TestStreamURL_ConfiguredButUnmatched(t *testing.T) {
 
 	l.Rebuild(nil)
 
-	url, configured, matched := l.StreamURL("1004")
+	s, configured, matched := l.Stream("1004")
 	if !configured {
 		t.Fatal("channel 1004 should be configured")
 	}
 	if matched {
-		t.Errorf("channel 1004 should be unmatched, got url %q", url)
+		t.Errorf("channel 1004 should be unmatched, got url %q", s.URL)
 	}
 }
 

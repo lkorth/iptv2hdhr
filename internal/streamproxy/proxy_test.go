@@ -6,6 +6,8 @@ import (
 	"net/http/httptest"
 	"os/exec"
 	"path/filepath"
+	"reflect"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -294,5 +296,167 @@ func TestServeHTTP_ConcurrentRequestsShareOneUpstreamConnection(t *testing.T) {
 	}
 	if got := connections.Load(); got != 1 {
 		t.Errorf("upstream connections opened = %d, want 1 (subscribers should share one session)", got)
+	}
+}
+
+func TestFfmpegHeaderArgs(t *testing.T) {
+	tests := []struct {
+		name    string
+		headers map[string]string
+		want    []string
+	}{
+		{
+			name:    "no headers uses default user agent",
+			headers: nil,
+			want:    []string{"-user_agent", upstreamUserAgent},
+		},
+		{
+			name:    "referer goes in -headers block",
+			headers: map[string]string{"Referer": "https://example.com/"},
+			want:    []string{"-user_agent", upstreamUserAgent, "-headers", "Referer: https://example.com/\r\n"},
+		},
+		{
+			name:    "user agent overrides default and is not duplicated in -headers",
+			headers: map[string]string{"User-Agent": "Foo/1.0", "Referer": "https://example.com/", "Origin": "https://example.com"},
+			want:    []string{"-user_agent", "Foo/1.0", "-headers", "Origin: https://example.com\r\nReferer: https://example.com/\r\n"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := ffmpegHeaderArgs(tt.headers)
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("ffmpegHeaderArgs(%v) = %q, want %q", tt.headers, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestServeHTTP_SendsEntryHeadersUpstream(t *testing.T) {
+	var gotReferer, gotUA string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotReferer = r.Header.Get("Referer")
+		gotUA = r.Header.Get("User-Agent")
+		w.Header().Set("Content-Type", "video/mp2t")
+		w.Write([]byte("mpegts-data-chunk"))
+	}))
+	defer upstream.Close()
+
+	l := newTestLineup(t)
+	l.Rebuild([]playlist.Entry{
+		{Name: "ESPN HD", TvgID: "ESPN.us", URL: upstream.URL,
+			Headers: map[string]string{"Referer": "https://example.com/", "User-Agent": "Foo/1.0"}},
+	})
+	h := New(l, context.Background())
+
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest("GET", "/stream/1001", nil)
+	h.ServeHTTP(w, r)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", w.Code, http.StatusOK)
+	}
+	if gotReferer != "https://example.com/" {
+		t.Errorf("upstream Referer = %q, want %q", gotReferer, "https://example.com/")
+	}
+	if gotUA != "Foo/1.0" {
+		t.Errorf("upstream User-Agent = %q, want %q", gotUA, "Foo/1.0")
+	}
+}
+
+func TestServeHTTP_HeaderChangeStartsNewSession(t *testing.T) {
+	var connections atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		connections.Add(1)
+		w.Header().Set("Content-Type", "video/mp2t")
+		flusher := w.(http.Flusher)
+		for i := 0; i < 50; i++ {
+			w.Write([]byte("x"))
+			flusher.Flush()
+			time.Sleep(2 * time.Millisecond)
+		}
+	}))
+	defer upstream.Close()
+
+	l := newTestLineup(t)
+	h := New(l, context.Background())
+
+	tune := func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+		defer cancel()
+		r := httptest.NewRequest("GET", "/stream/1001", nil).WithContext(ctx)
+		h.ServeHTTP(httptest.NewRecorder(), r)
+	}
+
+	l.Rebuild([]playlist.Entry{
+		{Name: "ESPN HD", TvgID: "ESPN.us", URL: upstream.URL, Headers: map[string]string{"Referer": "https://a.example/"}},
+	})
+	tune()
+	// Same URL, different Referer: must not reuse the (still idle-grace)
+	// session that was opened with the old headers.
+	l.Rebuild([]playlist.Entry{
+		{Name: "ESPN HD", TvgID: "ESPN.us", URL: upstream.URL, Headers: map[string]string{"Referer": "https://b.example/"}},
+	})
+	tune()
+
+	if got := connections.Load(); got != 2 {
+		t.Errorf("upstream connections opened = %d, want 2 (headers changed)", got)
+	}
+}
+
+// TestServeHTTP_HLSRefererForwardedToSegments verifies that a Referer from
+// the playlist entry reaches not just the initial playlist fetch but every
+// segment request ffmpeg makes.
+func TestServeHTTP_HLSRefererForwardedToSegments(t *testing.T) {
+	if _, err := exec.LookPath("ffmpeg"); err != nil {
+		t.Skip("ffmpeg not available")
+	}
+
+	dir := t.TempDir()
+	playlistPath := filepath.Join(dir, "playlist.m3u8")
+	generate := exec.Command("ffmpeg",
+		"-hide_banner", "-loglevel", "error",
+		"-f", "lavfi", "-i", "testsrc=duration=1:size=64x64:rate=10",
+		"-c:v", "libx264", "-f", "hls", "-hls_time", "1", "-hls_list_size", "0",
+		"-hls_segment_filename", filepath.Join(dir, "segment%d.ts"),
+		playlistPath,
+	)
+	if out, err := generate.CombinedOutput(); err != nil {
+		t.Skipf("could not generate HLS fixture: %v: %s", err, out)
+	}
+
+	const referer = "https://example.com/player"
+	var segmentRequests atomic.Int32
+	files := http.FileServer(http.Dir(dir))
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Referer") != referer {
+			http.Error(w, "forbidden", http.StatusForbidden)
+			return
+		}
+		if strings.HasSuffix(r.URL.Path, ".ts") {
+			segmentRequests.Add(1)
+		}
+		files.ServeHTTP(w, r)
+	}))
+	defer upstream.Close()
+
+	l := newTestLineup(t)
+	l.Rebuild([]playlist.Entry{
+		{Name: "ESPN HD", TvgID: "ESPN.us", URL: upstream.URL + "/playlist.m3u8",
+			Headers: map[string]string{"Referer": referer}},
+	})
+	h := New(l, context.Background())
+
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest("GET", "/stream/1001", nil)
+	h.ServeHTTP(w, r)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", w.Code, http.StatusOK)
+	}
+	if w.Body.Len() == 0 || w.Body.Bytes()[0] != 0x47 {
+		t.Fatal("remuxed body is empty or not MPEG-TS")
+	}
+	if segmentRequests.Load() == 0 {
+		t.Error("no segment was fetched with the Referer header")
 	}
 }

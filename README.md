@@ -40,6 +40,21 @@ upstreams, video is passed through unchanged but audio is re-encoded to AC-3
 AC-3 audio and fails to tune ("Could not tune channel") with AAC, even if
 copied byte-for-byte.
 
+Some upstreams require a `Referer` (or a particular `User-Agent`) on every
+request. Playlist entries can carry these using either convention:
+
+```
+#EXTINF:-1 tvg-id="Example.us",Example
+#EXTVLCOPT:http-referrer=https://example.com/player
+#EXTVLCOPT:http-user-agent=Mozilla/5.0
+https://cdn.example.com/live/stream.m3u8
+```
+
+or the Kodi/TiviMate pipe suffix:
+`https://cdn.example.com/live/stream.m3u8|Referer=https://example.com/`.
+The headers are sent on our own request and, for HLS, forwarded by ffmpeg
+to every playlist and segment fetch.
+
 ## Running with real Plex
 
 1. Run the image. Tagged releases are published to the GitHub

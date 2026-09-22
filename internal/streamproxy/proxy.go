@@ -32,7 +32,8 @@ import (
 const copyBufferSize = 64 * 1024
 
 // upstreamUserAgent is sent both on our own upstream request and (via
-// ffmpeg's -user_agent) on the remux input request.
+// ffmpeg's -user_agent) on the remux input request, unless the playlist
+// entry specifies its own User-Agent.
 const upstreamUserAgent = "iptv2hdhr/1.0"
 
 // ffmpegPath is the ffmpeg binary used to remux HLS upstreams. Overridable
@@ -83,13 +84,16 @@ func New(l *lineup.Lineup, ctx context.Context) *Handler {
 //   - If the upstream is an HLS playlist (by Content-Type or .m3u8/.m3u
 //     extension), the response is remuxed to MPEG-TS via ffmpeg. Otherwise the
 //     upstream body is passed through as-is.
+//   - Extra request headers from the playlist entry (e.g. a Referer from an
+//     #EXTVLCOPT:http-referrer line) are sent on the upstream request and, for
+//     HLS, forwarded by ffmpeg to every playlist/segment fetch.
 //
 // The underlying upstream connection (and ffmpeg process, for HLS) is shared
 // with any other request currently tuned to the same channel number.
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	number := strings.TrimPrefix(r.URL.Path, "/stream/")
 
-	upstreamURL, configured, matched := h.lineup.StreamURL(number)
+	stream, configured, matched := h.lineup.Stream(number)
 	if !configured {
 		http.Error(w, "channel not found", http.StatusNotFound)
 		return
@@ -99,7 +103,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	s, ch, ok := h.getOrCreateSession(number, upstreamURL)
+	s, ch, ok := h.getOrCreateSession(number, stream)
 	if !ok {
 		// Rare race: an existing session ended right as we tried to join
 		// it. The client (or Plex) will retry, establishing a fresh

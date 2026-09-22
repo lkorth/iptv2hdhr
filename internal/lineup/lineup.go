@@ -5,6 +5,7 @@ package lineup
 
 import (
 	"fmt"
+	"maps"
 	"sync/atomic"
 
 	"iptv2hdhr/internal/config"
@@ -22,11 +23,25 @@ type Channel struct {
 	ChannelID string // "slot-"+Number, stable XMLTV channel id
 }
 
+// Stream is the upstream source currently matched to a channel: the URL to
+// fetch plus any extra request headers (e.g. Referer) the playlist entry
+// asked for.
+type Stream struct {
+	URL     string
+	Headers map[string]string // canonical header name -> value; nil if none
+}
+
+// Equal reports whether s and o refer to the same upstream with the same
+// request headers.
+func (s Stream) Equal(o Stream) bool {
+	return s.URL == o.URL && maps.Equal(s.Headers, o.Headers)
+}
+
 // Snapshot is the immutable, currently-active lineup and match cache.
 // Replaced wholesale on each playlist refresh via atomic.Pointer.
 type Snapshot struct {
-	Channels  []Channel         // static, from config, in config order — never changes shape
-	StreamURL map[string]string // Number -> matched upstream URL (only present if a match was found)
+	Channels []Channel         // static, from config, in config order — never changes shape
+	Streams  map[string]Stream // Number -> matched upstream (only present if a match was found)
 }
 
 // Lineup holds the immutable channel list and the latest match snapshot.
@@ -63,8 +78,8 @@ func New(cfg []config.Channel) (*Lineup, error) {
 		numberIndex: numberIndex,
 	}
 	l.current.Store(&Snapshot{
-		Channels:  channels,
-		StreamURL: make(map[string]string),
+		Channels: channels,
+		Streams:  make(map[string]Stream),
 	})
 	return l, nil
 }
@@ -91,15 +106,15 @@ func (l *Lineup) ChannelByNumber(number string) (ch Channel, ok bool) {
 	return l.channels[idx], true
 }
 
-// StreamURL looks up the current matched upstream URL for a configured
-// channel number. ok is false if the number isn't configured at all, or if
-// it's configured but currently has no match.
-func (l *Lineup) StreamURL(number string) (url string, configured bool, matched bool) {
+// Stream looks up the current matched upstream for a configured channel
+// number. configured is false if the number isn't configured at all;
+// matched is false if it's configured but currently has no match.
+func (l *Lineup) Stream(number string) (s Stream, configured bool, matched bool) {
 	if _, exists := l.numberIndex[number]; !exists {
-		return "", false, false
+		return Stream{}, false, false
 	}
-	url, matched = l.current.Load().StreamURL[number]
-	return url, true, matched
+	s, matched = l.current.Load().Streams[number]
+	return s, true, matched
 }
 
 // Rebuild recomputes the match cache from the given playlist entries and
@@ -108,15 +123,15 @@ func (l *Lineup) StreamURL(number string) (url string, configured bool, matched 
 func (l *Lineup) Rebuild(entries []playlist.Entry) {
 	idx := buildMatchIndex(entries)
 
-	streamURL := make(map[string]string, len(l.channels))
+	streams := make(map[string]Stream, len(l.channels))
 	for _, ch := range l.channels {
-		if url, ok := matchChannel(ch, idx); ok {
-			streamURL[ch.Number] = url
+		if e, ok := matchChannel(ch, idx); ok {
+			streams[ch.Number] = Stream{URL: e.URL, Headers: e.Headers}
 		}
 	}
 
 	l.current.Store(&Snapshot{
-		Channels:  l.channels,
-		StreamURL: streamURL,
+		Channels: l.channels,
+		Streams:  streams,
 	})
 }

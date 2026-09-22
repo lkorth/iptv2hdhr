@@ -8,9 +8,12 @@ import (
 	"log"
 	"net/http"
 	"os/exec"
+	"sort"
 	"strings"
 	"sync"
 	"time"
+
+	"iptv2hdhr/internal/lineup"
 )
 
 // subscriberQueueSize is how many copyBufferSize chunks a subscriber's
@@ -37,8 +40,8 @@ const idleSessionGrace = 5 * time.Second
 // an IPTV provider sees at most one connection per channel regardless of how
 // many Plex tuners are watching it.
 type session struct {
-	number      string
-	upstreamURL string
+	number string
+	stream lineup.Stream
 
 	// contentType and err are written once by runSession before ready is
 	// closed, and read by subscribers only after observing ready closed, so
@@ -56,8 +59,9 @@ type session struct {
 }
 
 // getOrCreateSession returns the active session for number (creating one if
-// none exists or if the matched upstream URL has changed since the existing
-// session was started) along with a subscription for the calling request.
+// none exists or if the matched upstream URL/headers have changed since the
+// existing session was started) along with a subscription for the calling
+// request.
 // ok is false if an existing session ended right as we tried to join it; the
 // caller should report the channel as temporarily unavailable and let the
 // client retry.
@@ -65,11 +69,11 @@ type session struct {
 // For a newly-created session, the subscription is registered before the
 // session's goroutine starts, so the producer can never finish (or broadcast
 // data) before the triggering request is listening.
-func (h *Handler) getOrCreateSession(number, upstreamURL string) (*session, chan []byte, bool) {
+func (h *Handler) getOrCreateSession(number string, stream lineup.Stream) (*session, chan []byte, bool) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
-	if s, ok := h.sessions[number]; ok && s.upstreamURL == upstreamURL && !s.isClosed() {
+	if s, ok := h.sessions[number]; ok && s.stream.Equal(stream) && !s.isClosed() {
 		ch, ok := s.subscribe()
 		return s, ch, ok
 	}
@@ -79,11 +83,11 @@ func (h *Handler) getOrCreateSession(number, upstreamURL string) (*session, chan
 
 	ctx, cancel := context.WithCancel(h.ctx)
 	s := &session{
-		number:      number,
-		upstreamURL: upstreamURL,
-		ready:       make(chan struct{}),
-		subs:        make(map[chan []byte]struct{}),
-		cancel:      cancel,
+		number: number,
+		stream: stream,
+		ready:  make(chan struct{}),
+		subs:   make(map[chan []byte]struct{}),
+		cancel: cancel,
 	}
 	ch := make(chan []byte, subscriberQueueSize)
 	s.subs[ch] = struct{}{}
@@ -212,12 +216,15 @@ func (h *Handler) runSession(ctx context.Context, s *session) {
 		s.stop()
 	}()
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, s.upstreamURL, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, s.stream.URL, nil)
 	if err != nil {
 		s.fail(err)
 		return
 	}
 	req.Header.Set("User-Agent", upstreamUserAgent)
+	for k, v := range s.stream.Headers {
+		req.Header.Set(k, v)
+	}
 
 	resp, err := h.client.Do(req)
 	if err != nil {
@@ -231,7 +238,7 @@ func (h *Handler) runSession(ctx context.Context, s *session) {
 		return
 	}
 
-	if isHLS(s.upstreamURL, resp.Header.Get("Content-Type")) {
+	if isHLS(s.stream.URL, resp.Header.Get("Content-Type")) {
 		resp.Body.Close()
 		s.runRemux(ctx)
 		return
@@ -262,8 +269,10 @@ func (s *session) pump(r io.Reader) {
 	}
 }
 
-// runRemux runs ffmpeg to remux s.upstreamURL (an HLS playlist) into a
-// continuous MPEG-TS stream and pumps its stdout to subscribers.
+// runRemux runs ffmpeg to remux s.stream.URL (an HLS playlist) into a
+// continuous MPEG-TS stream and pumps its stdout to subscribers. Any extra
+// request headers on the stream are passed via -headers/-user_agent, which
+// ffmpeg's HLS demuxer forwards to every playlist and segment request.
 //
 // Video is passed through unmodified (-c:v copy). Audio is re-encoded to
 // AC-3: Plex's HDHomeRun tuner emulation expects ATSC-style AC-3 audio, and
@@ -277,17 +286,20 @@ func (s *session) pump(r io.Reader) {
 // killed and the channel is reported unavailable rather than leaving
 // subscribers waiting on a stuck process.
 func (s *session) runRemux(ctx context.Context) {
-	cmd := exec.CommandContext(ctx, ffmpegPath,
+	args := []string{
 		"-hide_banner", "-loglevel", "error",
-		"-user_agent", upstreamUserAgent,
 		"-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "5",
+	}
+	args = append(args, ffmpegHeaderArgs(s.stream.Headers)...)
+	args = append(args,
 		"-re",
-		"-i", s.upstreamURL,
+		"-i", s.stream.URL,
 		"-c:v", "copy",
 		"-c:a", "ac3", "-b:a", "192k",
 		"-f", "mpegts",
 		"-",
 	)
+	cmd := exec.CommandContext(ctx, ffmpegPath, args...)
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
@@ -307,7 +319,7 @@ func (s *session) runRemux(ctx context.Context) {
 	if err != nil {
 		cmd.Process.Kill()
 		cmd.Wait()
-		s.fail(fmt.Errorf("remux for %s produced no output: %w", s.upstreamURL, err))
+		s.fail(fmt.Errorf("remux for %s produced no output: %w", s.stream.URL, err))
 		return
 	}
 
@@ -320,8 +332,31 @@ func (s *session) runRemux(ctx context.Context) {
 	s.pump(stdout)
 
 	if err := cmd.Wait(); err != nil && ctx.Err() == nil {
-		log.Printf("stream remux for %s: ffmpeg exited: %v: %s", s.upstreamURL, err, strings.TrimSpace(stderr.String()))
+		log.Printf("stream remux for %s: ffmpeg exited: %v: %s", s.stream.URL, err, strings.TrimSpace(stderr.String()))
 	}
+}
+
+// ffmpegHeaderArgs builds the ffmpeg input options that set the request
+// User-Agent and any extra headers. User-Agent goes through -user_agent
+// (defaulting to upstreamUserAgent); everything else is joined into a single
+// CRLF-terminated -headers block, in sorted order so the argv is stable.
+func ffmpegHeaderArgs(headers map[string]string) []string {
+	userAgent := upstreamUserAgent
+	var extra []string
+	for k, v := range headers {
+		if strings.EqualFold(k, "User-Agent") {
+			userAgent = v
+			continue
+		}
+		extra = append(extra, k+": "+v+"\r\n")
+	}
+	sort.Strings(extra)
+
+	args := []string{"-user_agent", userAgent}
+	if len(extra) > 0 {
+		args = append(args, "-headers", strings.Join(extra, ""))
+	}
+	return args
 }
 
 // readWithTimeout reads from r into buf, returning an error if no read
