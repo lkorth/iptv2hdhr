@@ -1,7 +1,7 @@
 package streamproxy
 
 import (
-	"bytes"
+	"bufio"
 	"context"
 	"fmt"
 	"io"
@@ -196,6 +196,7 @@ func (s *session) broadcast(chunk []byte) {
 		select {
 		case ch <- buf:
 		default:
+			log.Printf("stream %s: dropping subscriber that fell %d chunks behind", s.number, subscriberQueueSize)
 			close(ch)
 			delete(s.subs, ch)
 		}
@@ -207,6 +208,8 @@ func (s *session) broadcast(chunk []byte) {
 // cancelled, or (for HLS) the ffmpeg remux process exits. It always removes
 // s from the handler's session registry and stops it before returning.
 func (h *Handler) runSession(ctx context.Context, s *session) {
+	started := time.Now()
+	log.Printf("stream %s: session starting for %s", s.number, s.stream.URL)
 	defer func() {
 		h.mu.Lock()
 		if h.sessions[s.number] == s {
@@ -214,6 +217,13 @@ func (h *Handler) runSession(ctx context.Context, s *session) {
 		}
 		h.mu.Unlock()
 		s.stop()
+		reason := "upstream ended"
+		if s.err != nil {
+			reason = "startup failed: " + s.err.Error()
+		} else if ctx.Err() != nil {
+			reason = "stopped (no subscribers or shutdown)"
+		}
+		log.Printf("stream %s: session ended after %s: %s", s.number, time.Since(started).Round(time.Second), reason)
 	}()
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, s.stream.URL, nil)
@@ -287,7 +297,7 @@ func (s *session) pump(r io.Reader) {
 // subscribers waiting on a stuck process.
 func (s *session) runRemux(ctx context.Context) {
 	args := []string{
-		"-hide_banner", "-loglevel", "error",
+		"-hide_banner", "-loglevel", "warning",
 		"-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "5",
 	}
 	args = append(args, ffmpegHeaderArgs(s.stream.Headers)...)
@@ -306,20 +316,42 @@ func (s *session) runRemux(ctx context.Context) {
 		s.fail(err)
 		return
 	}
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		s.fail(err)
+		return
+	}
 
 	if err := cmd.Start(); err != nil {
 		s.fail(err)
 		return
 	}
 
+	// Relay ffmpeg's warnings/errors to our log as they happen, so stalls,
+	// segment fetch failures and reconnects are visible while the stream is
+	// still running rather than only once it exits.
+	var lastErr string
+	stderrDone := make(chan struct{})
+	go func() {
+		defer close(stderrDone)
+		sc := bufio.NewScanner(stderr)
+		for sc.Scan() {
+			line := strings.TrimSpace(sc.Text())
+			if line == "" {
+				continue
+			}
+			lastErr = line
+			log.Printf("stream %s: ffmpeg: %s", s.number, line)
+		}
+	}()
+
 	buf := make([]byte, copyBufferSize)
 	n, err := readWithTimeout(stdout, buf, ffmpegStartupTimeout)
 	if err != nil {
 		cmd.Process.Kill()
+		<-stderrDone
 		cmd.Wait()
-		s.fail(fmt.Errorf("remux for %s produced no output: %w", s.stream.URL, err))
+		s.fail(fmt.Errorf("remux for %s produced no output: %w (last ffmpeg message: %q)", s.stream.URL, err, lastErr))
 		return
 	}
 
@@ -331,8 +363,9 @@ func (s *session) runRemux(ctx context.Context) {
 	}
 	s.pump(stdout)
 
+	<-stderrDone
 	if err := cmd.Wait(); err != nil && ctx.Err() == nil {
-		log.Printf("stream remux for %s: ffmpeg exited: %v: %s", s.stream.URL, err, strings.TrimSpace(stderr.String()))
+		log.Printf("stream %s: ffmpeg exited: %v (last message: %q)", s.number, err, lastErr)
 	}
 }
 

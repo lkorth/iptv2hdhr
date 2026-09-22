@@ -15,6 +15,7 @@ package streamproxy
 
 import (
 	"context"
+	"log"
 	"net"
 	"net/http"
 	"net/url"
@@ -134,15 +135,18 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		select {
 		case chunk, open := <-ch:
 			if !open {
+				log.Printf("stream %s: client %s: session closed (ended, or client too slow)", number, r.RemoteAddr)
 				return
 			}
 			if _, err := w.Write(chunk); err != nil {
+				log.Printf("stream %s: client %s: write failed: %v", number, r.RemoteAddr, err)
 				return
 			}
 			if flusher != nil {
 				flusher.Flush()
 			}
 		case <-r.Context().Done():
+			log.Printf("stream %s: client %s disconnected", number, r.RemoteAddr)
 			return
 		}
 	}

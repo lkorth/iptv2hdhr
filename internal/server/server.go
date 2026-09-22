@@ -5,6 +5,7 @@ package server
 import (
 	"compress/gzip"
 	"context"
+	"log"
 	"net/http"
 	"strings"
 	"time"
@@ -43,9 +44,33 @@ func New(ctx context.Context, cfg *config.Config, lin *lineup.Lineup, gf *guide.
 	return &Server{mux: mux}
 }
 
-// ServeHTTP implements http.Handler.
+// ServeHTTP implements http.Handler. Every request is logged with its
+// status, which is the main way to see what Plex is doing (when it scans,
+// when it refreshes the guide, and how it identifies itself).
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	s.mux.ServeHTTP(w, r)
+	sw := &statusWriter{ResponseWriter: w, status: http.StatusOK}
+	start := time.Now()
+	s.mux.ServeHTTP(sw, r)
+	log.Printf("%s %s %s -> %d (%s) %q", r.RemoteAddr, r.Method, r.URL.RequestURI(), sw.status, time.Since(start).Round(time.Millisecond), r.UserAgent())
+}
+
+// statusWriter records the status code written through it for logging. It
+// passes Flush through so streaming handlers keep their low-latency
+// behaviour.
+type statusWriter struct {
+	http.ResponseWriter
+	status int
+}
+
+func (w *statusWriter) WriteHeader(code int) {
+	w.status = code
+	w.ResponseWriter.WriteHeader(code)
+}
+
+func (w *statusWriter) Flush() {
+	if f, ok := w.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
 }
 
 // guideHandler serves /guide.xml, generated fresh on every request. XMLTV
