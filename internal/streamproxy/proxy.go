@@ -104,7 +104,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	s, ch, ok := h.getOrCreateSession(number, stream)
+	s, sub, ok := h.getOrCreateSession(number, stream)
 	if !ok {
 		// Rare race: an existing session ended right as we tried to join
 		// it. The client (or Plex) will retry, establishing a fresh
@@ -116,16 +116,16 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	select {
 	case <-s.ready:
 	case <-r.Context().Done():
-		h.unsubscribe(number, s, ch)
+		h.unsubscribe(number, s, sub)
 		return
 	}
 
 	if s.err != nil {
-		h.unsubscribe(number, s, ch)
+		h.unsubscribe(number, s, sub)
 		http.Error(w, "upstream error", http.StatusServiceUnavailable)
 		return
 	}
-	defer h.unsubscribe(number, s, ch)
+	defer h.unsubscribe(number, s, sub)
 
 	w.Header().Set("Content-Type", s.contentType)
 	w.WriteHeader(http.StatusOK)
@@ -133,17 +133,20 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	flusher, _ := w.(http.Flusher)
 	for {
 		select {
-		case chunk, open := <-ch:
-			if !open {
-				log.Printf("stream %s: client %s: session closed (ended, or client too slow)", number, r.RemoteAddr)
-				return
+		case <-sub.notify:
+			data, closed := sub.take()
+			if len(data) > 0 {
+				if _, err := w.Write(data); err != nil {
+					log.Printf("stream %s: client %s: write failed: %v", number, r.RemoteAddr, err)
+					return
+				}
+				if flusher != nil {
+					flusher.Flush()
+				}
 			}
-			if _, err := w.Write(chunk); err != nil {
-				log.Printf("stream %s: client %s: write failed: %v", number, r.RemoteAddr, err)
+			if closed {
+				log.Printf("stream %s: client %s: session ended", number, r.RemoteAddr)
 				return
-			}
-			if flusher != nil {
-				flusher.Flush()
 			}
 		case <-r.Context().Done():
 			log.Printf("stream %s: client %s disconnected", number, r.RemoteAddr)

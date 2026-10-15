@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os/exec"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -16,17 +17,46 @@ import (
 	"iptv2hdhr/internal/lineup"
 )
 
-// subscriberQueueSize is how many copyBufferSize chunks a subscriber's
-// channel can buffer (~4MB) before it's considered too slow to keep up and
-// is dropped, so one slow client can't hold up the others or grow memory
-// without bound.
-const subscriberQueueSize = 64
+// maxSubscriberBacklog is how many bytes a subscriber can have queued (not
+// yet written to its client) before it's considered too slow to keep up.
+// Rather than disconnecting it (which stops playback and makes the viewer
+// retune), its backlog is discarded so it skips ahead to live: for live TV a
+// brief glitch is better than an error. This also keeps one slow client from
+// holding up the others or growing memory without bound.
+//
+// It's measured in bytes rather than chunks because chunk sizes vary widely:
+// ffmpeg's pipe output arrives in reads of ~8KB on average, so a limit in
+// chunks would allow only about a second of video. 16MB is ~40s of a
+// typical 3Mbit/s stream, enough to absorb the bursts ffmpeg sends when
+// catching up after a late HLS segment.
+const maxSubscriberBacklog = 16 * 1024 * 1024
+
+// tsPacketSize is the size of an MPEG-TS packet. Discarded backlog is always
+// a whole number of packets, so the client's demuxer stays aligned to packet
+// boundaries across the gap, and the join prebuffer always starts on a
+// packet boundary.
+const tsPacketSize = 188
+
+// joinPrebufferSize is how much of a session's most recent output is kept so
+// that a client joining an already-running session (e.g. Plex retuning
+// within idleSessionGrace, or a second tuner on the same channel) starts with
+// a cushion of data rather than at the live edge, where any late upstream
+// segment would stall its playback. 4MB is ~10s of a typical 3Mbit/s stream.
+// It must stay well under maxSubscriberBacklog, since a joiner's backlog
+// starts at this size.
+const joinPrebufferSize = 4 * 1024 * 1024
 
 // ffmpegStartupTimeout bounds how long we wait for ffmpeg to produce its
 // first output bytes when remuxing an HLS upstream. If exceeded, the
 // channel is reported unavailable (503) rather than leaving the client
 // waiting indefinitely on a stuck process.
 const ffmpegStartupTimeout = 15 * time.Second
+
+// hlsLiveStartSegments is how many segments back from the live edge of an
+// HLS playlist ffmpeg starts, which sets how late an upstream segment can
+// arrive before playback stalls (see runRemux): with typical 6s segments,
+// 3 segments is ~18s.
+const hlsLiveStartSegments = 3
 
 // idleSessionGrace is how long a session with no subscribers is kept alive
 // (upstream connection / ffmpeg process still running) before being torn
@@ -51,9 +81,15 @@ type session struct {
 	ready       chan struct{}
 
 	mu        sync.Mutex
-	subs      map[chan []byte]struct{}
+	subs      map[*subscriber]struct{}
 	closed    bool
 	idleTimer *time.Timer
+
+	// recent holds up to joinPrebufferSize bytes of the session's most recent
+	// output, starting at byte offset recentStart of the session's output
+	// (always a multiple of tsPacketSize). New subscribers are sent it first.
+	recent      []byte
+	recentStart int64
 
 	cancel context.CancelFunc
 }
@@ -69,13 +105,13 @@ type session struct {
 // For a newly-created session, the subscription is registered before the
 // session's goroutine starts, so the producer can never finish (or broadcast
 // data) before the triggering request is listening.
-func (h *Handler) getOrCreateSession(number string, stream lineup.Stream) (*session, chan []byte, bool) {
+func (h *Handler) getOrCreateSession(number string, stream lineup.Stream) (*session, *subscriber, bool) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
 	if s, ok := h.sessions[number]; ok && s.stream.Equal(stream) && !s.isClosed() {
-		ch, ok := s.subscribe()
-		return s, ch, ok
+		sub, ok := s.subscribe()
+		return s, sub, ok
 	}
 	if s, ok := h.sessions[number]; ok {
 		s.stop()
@@ -86,15 +122,15 @@ func (h *Handler) getOrCreateSession(number string, stream lineup.Stream) (*sess
 		number: number,
 		stream: stream,
 		ready:  make(chan struct{}),
-		subs:   make(map[chan []byte]struct{}),
+		subs:   make(map[*subscriber]struct{}),
 		cancel: cancel,
 	}
-	ch := make(chan []byte, subscriberQueueSize)
-	s.subs[ch] = struct{}{}
+	sub := newSubscriber()
+	s.subs[sub] = struct{}{}
 
 	h.sessions[number] = s
 	go h.runSession(ctx, s)
-	return s, ch, true
+	return s, sub, true
 }
 
 func (s *session) isClosed() bool {
@@ -105,7 +141,7 @@ func (s *session) isClosed() bool {
 
 // subscribe registers a new subscriber, returning ok=false if the session
 // has already ended.
-func (s *session) subscribe() (chan []byte, bool) {
+func (s *session) subscribe() (*subscriber, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.closed {
@@ -115,21 +151,22 @@ func (s *session) subscribe() (chan []byte, bool) {
 		s.idleTimer.Stop()
 		s.idleTimer = nil
 	}
-	ch := make(chan []byte, subscriberQueueSize)
-	s.subs[ch] = struct{}{}
-	return ch, true
+	sub := newSubscriber()
+	sub.push(s.recent)
+	s.subs[sub] = struct{}{}
+	return sub, true
 }
 
-// unsubscribe removes ch from s's subscriber set. If s has no remaining
+// unsubscribe removes sub from s's subscriber set. If s has no remaining
 // subscribers, it's scheduled to be torn down after idleSessionGrace unless
 // a new subscriber joins first.
-func (h *Handler) unsubscribe(number string, s *session, ch chan []byte) {
+func (h *Handler) unsubscribe(number string, s *session, sub *subscriber) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.closed {
 		return
 	}
-	delete(s.subs, ch)
+	delete(s.subs, sub)
 	if len(s.subs) == 0 {
 		s.idleTimer = time.AfterFunc(idleSessionGrace, func() {
 			h.endIfIdle(number, s)
@@ -157,7 +194,7 @@ func (h *Handler) endIfIdle(number string, s *session) {
 }
 
 // stop ends the session: it cancels the upstream connection/ffmpeg process
-// and closes every subscriber's channel so their requests complete.
+// and closes every subscriber so their requests complete.
 func (s *session) stop() {
 	s.mu.Lock()
 	if s.closed {
@@ -169,8 +206,8 @@ func (s *session) stop() {
 		s.idleTimer.Stop()
 		s.idleTimer = nil
 	}
-	for ch := range s.subs {
-		close(ch)
+	for sub := range s.subs {
+		sub.close()
 	}
 	s.subs = nil
 	s.mu.Unlock()
@@ -184,23 +221,96 @@ func (s *session) fail(err error) {
 	close(s.ready)
 }
 
-// broadcast sends a copy of chunk to every current subscriber. A subscriber
-// whose queue is full (too slow to keep up) is dropped so it can't block the
-// others.
+// broadcast queues a copy of chunk for every current subscriber, and keeps
+// it in the join prebuffer for future subscribers. A subscriber whose
+// backlog would exceed maxSubscriberBacklog (too slow to keep up) skips
+// ahead to live rather than blocking the others.
 func (s *session) broadcast(chunk []byte) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	for ch := range s.subs {
-		buf := make([]byte, len(chunk))
-		copy(buf, chunk)
-		select {
-		case ch <- buf:
-		default:
-			log.Printf("stream %s: dropping subscriber that fell %d chunks behind", s.number, subscriberQueueSize)
-			close(ch)
-			delete(s.subs, ch)
+
+	s.recent = append(s.recent, chunk...)
+	if excess := len(s.recent) - joinPrebufferSize; excess > 0 {
+		// Trim from the front, rounding up so the prebuffer still starts on
+		// an MPEG-TS packet boundary of the session's output.
+		end := s.recentStart + int64(excess)
+		if rem := end % tsPacketSize; rem != 0 {
+			end += tsPacketSize - rem
+		}
+		trim := int(end - s.recentStart)
+		s.recent = s.recent[trim:]
+		s.recentStart = end
+	}
+
+	for sub := range s.subs {
+		if skipped := sub.push(chunk); skipped > 0 {
+			log.Printf("stream %s: client fell more than %dMB behind, skipped %d bytes to catch up with live", s.number, maxSubscriberBacklog/(1024*1024), skipped)
 		}
 	}
+}
+
+// subscriber is one client's queue of session output that hasn't been
+// written to it yet. Chunks broadcast while the client is busy writing are
+// coalesced into a single buffer, so the backlog is bounded by bytes
+// (maxSubscriberBacklog) regardless of how small the individual chunks are.
+type subscriber struct {
+	mu      sync.Mutex
+	pending []byte
+	closed  bool
+
+	// notify is signalled (without blocking) whenever pending gains data or
+	// the subscriber is closed.
+	notify chan struct{}
+}
+
+func newSubscriber() *subscriber {
+	return &subscriber{notify: make(chan struct{}, 1)}
+}
+
+// push appends a copy of chunk to the subscriber's backlog. If that would
+// exceed maxSubscriberBacklog, the existing backlog (rounded down to whole
+// MPEG-TS packets) is discarded first; push returns how many bytes were
+// discarded.
+func (sub *subscriber) push(chunk []byte) int {
+	if len(chunk) == 0 {
+		return 0
+	}
+	sub.mu.Lock()
+	skipped := 0
+	if len(sub.pending)+len(chunk) > maxSubscriberBacklog {
+		skipped = len(sub.pending) - len(sub.pending)%tsPacketSize
+		sub.pending = append([]byte(nil), sub.pending[skipped:]...)
+	}
+	sub.pending = append(sub.pending, chunk...)
+	sub.mu.Unlock()
+	sub.signal()
+	return skipped
+}
+
+// close marks the subscriber as ended. Data already queued is still
+// returned by take.
+func (sub *subscriber) close() {
+	sub.mu.Lock()
+	sub.closed = true
+	sub.mu.Unlock()
+	sub.signal()
+}
+
+func (sub *subscriber) signal() {
+	select {
+	case sub.notify <- struct{}{}:
+	default:
+	}
+}
+
+// take removes and returns everything queued so far, and whether the
+// subscriber has been closed (in which case nothing more will be queued).
+func (sub *subscriber) take() ([]byte, bool) {
+	sub.mu.Lock()
+	defer sub.mu.Unlock()
+	data := sub.pending
+	sub.pending = nil
+	return data, sub.closed
 }
 
 // runSession establishes the shared upstream connection for s and, on
@@ -288,9 +398,19 @@ func (s *session) pump(r io.Reader) {
 // AC-3: Plex's HDHomeRun tuner emulation expects ATSC-style AC-3 audio, and
 // fails to tune (codecpar sample_rate/channels never populate, "sample rate
 // not set") when the audio is AAC, even when copied byte-for-byte from a
-// well-formed source. -re paces ffmpeg's reads at the input's real-time rate
-// so the output stream matches a real tuner's steady bitrate rather than
-// arriving in bursts.
+// well-formed source.
+//
+// ffmpeg starts hlsLiveStartSegments segments back from the live edge, and
+// -re paces its output at the input's real-time rate, so it stays that far
+// behind the live edge. That gap is the cushion against late upstream
+// segments: a segment that arrives late isn't needed until ffmpeg reaches
+// it. Without -re, ffmpeg sends each segment as soon as it downloads, so the
+// client receives the stream in segment-sized blocks at the live edge, and
+// Plex (which plays close to the newest data it has) stutters whenever a
+// segment is late.
+//
+// After a stall ffmpeg still sends the delayed data as a burst to catch up;
+// maxSubscriberBacklog absorbs that.
 //
 // If ffmpeg doesn't produce any output within ffmpegStartupTimeout, it's
 // killed and the channel is reported unavailable rather than leaving
@@ -302,6 +422,7 @@ func (s *session) runRemux(ctx context.Context) {
 	}
 	args = append(args, ffmpegHeaderArgs(s.stream.Headers)...)
 	args = append(args,
+		"-live_start_index", strconv.Itoa(-hlsLiveStartSegments),
 		"-re",
 		"-i", s.stream.URL,
 		"-c:v", "copy",
